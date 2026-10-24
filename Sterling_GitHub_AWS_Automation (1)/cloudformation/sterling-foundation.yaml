@@ -1,0 +1,422 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Sterling Digital Solutions - AWS Academy-friendly FinTech proof of concept.
+  VPC across two AZs, internet-facing ALB, EC2 Auto Scaling web tier,
+  restricted web security group, and on-demand DynamoDB sample table.
+  The optional private-web mode creates one NAT gateway and incurs extra cost.
+
+Parameters:
+  WebPlacement:
+    Type: String
+    AllowedValues: [public, private]
+    Default: public
+    Description: >-
+      'public' keeps EC2 in public subnets for a lower-cost learner-lab PoC,
+      protected by security groups allowing only ALB-originated HTTP traffic.
+      'private' places EC2 in private subnets using one NAT gateway for updates.
+  WebInstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t2.micro, t3.micro]
+    Description: Small EC2 instance for the coursework proof of concept.
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Official latest Amazon Linux 2023 x86_64 AMI in the selected region.
+
+Conditions:
+  UsePrivateWebTier: !Equals [!Ref WebPlacement, private]
+
+Resources:
+  # NETWORK: One VPC spanning two availability zones with two public and
+  # two private subnets. Private subnets are reserved in public PoC mode.
+  SterlingVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+        - Key: Project
+          Value: SterlingDigitalSolutions
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-igw'
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref SterlingVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref SterlingVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-az-a'
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref SterlingVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-az-b'
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref SterlingVPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-az-a'
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref SterlingVPC
+      CidrBlock: 10.0.12.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-az-b'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref SterlingVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-rt'
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicRouteAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicRouteAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref SterlingVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-rt-a'
+
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref SterlingVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-rt-b'
+
+  PrivateRouteAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTableA
+
+  PrivateRouteAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTableB
+
+  # COST NOTE: Created only when WebPlacement=private. One NAT is not
+  # egress-AZ fault tolerant; a production design should consider one NAT/AZ
+  # or endpoints with appropriate network architecture.
+  NatEip:
+    Type: AWS::EC2::EIP
+    Condition: UsePrivateWebTier
+    DependsOn: GatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: UsePrivateWebTier
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-az-a'
+
+  PrivateDefaultRouteA:
+    Type: AWS::EC2::Route
+    Condition: UsePrivateWebTier
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateDefaultRouteB:
+    Type: AWS::EC2::Route
+    Condition: UsePrivateWebTier
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableB
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  # SECURITY: Public port 80 only to ALB; web tier port 80 ONLY from ALB SG.
+  # SSH (22) is deliberately not open. Use secure operations in later phases.
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTP ingress to Sterling proof-of-concept ALB
+      VpcId: !Ref SterlingVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP PoC only; move to ACM HTTPS for production
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alb-sg'
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web HTTP ingress from ALB security group only
+      VpcId: !Ref SterlingVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: ALB to private/application web tier only
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-web-sg'
+
+  # DATA: On-demand table has no provisioned RCU/WCU to size manually.
+  # Deleting the stack also deletes this coursework demo table/data.
+  TradingMarketData:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-TradingMarketData'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: StockSymbol
+          AttributeType: S
+      KeySchema:
+        - AttributeName: StockSymbol
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: SterlingDigitalSolutions
+        - Key: Workload
+          Value: CourseworkDemo
+
+  # WEB: 2 AZs + ELB health checks; user data installs and starts Apache.
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      VpcId: !Ref SterlingVPC
+      HealthCheckEnabled: true
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: '200'
+      Tags:
+        - Key: Project
+          Value: SterlingDigitalSolutions
+
+  SterlingALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: GatewayAttachment
+    Properties:
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      Tags:
+        - Key: Project
+          Value: SterlingDigitalSolutions
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref SterlingALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebTargetGroup
+
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-web-launch-template'
+      VersionDescription: Sterling web server with Apache and metadata v2
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref WebInstanceType
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        Monitoring:
+          Enabled: false
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: !If [UsePrivateWebTier, false, true]
+            DeleteOnTermination: true
+            Groups: [!Ref WebSecurityGroup]
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-web'
+              - Key: Project
+                Value: SterlingDigitalSolutions
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+            dnf -y install httpd
+            mkdir -p /var/www/html
+            cat > /var/www/html/index.html <<'HTML'
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1">
+              <title>Sterling Digital Solutions | AWS PoC</title>
+              <style>
+                body { font-family: system-ui,Arial,sans-serif; background:#f3f6fb; color:#16253b; margin:0; }
+                main { max-width:700px; margin:9vh auto; padding:38px; border-radius:18px; background:#fff; box-shadow:0 10px 26px #dce4ef; }
+                h1 { color:#0e5ba3; } .note { color:#526680; }
+                .pill { display:inline-block; padding:8px 12px; background:#e6f4e9; border-radius:9px; color:#26643b; }
+              </style>
+            </head>
+            <body>
+              <main>
+                <span class="pill">AWS CloudFormation deployment</span>
+                <h1>Sterling Digital Solutions</h1>
+                <h2>Welcome to our AWS web-tier proof of concept</h2>
+                <p>Apache serves this demonstration site on EC2 instances managed by an Auto Scaling Group.</p>
+                <p class="note">Architecture: Application Load Balancer / 2 Availability Zones / Amazon DynamoDB.</p>
+                <p class="note">This HTTP demonstration is not a production banking application.</p>
+              </main>
+            </body>
+            </html>
+            HTML
+            chmod 644 /var/www/html/index.html
+            systemctl enable --now httpd
+
+  WebAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - PublicDefaultRoute
+    Properties:
+      MinSize: '2'
+      DesiredCapacity: '2'
+      MaxSize: '4'
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      VPCZoneIdentifier: !If
+        - UsePrivateWebTier
+        - [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+        - [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      TargetGroupARNs:
+        - !Ref WebTargetGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-autoscaled-web'
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: SterlingDigitalSolutions
+          PropagateAtLaunch: true
+
+  # TARGET TRACKING: scaling policy can be tested separately using CPU load.
+  WebCpuScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WebAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 60.0
+        DisableScaleIn: false
+
+Outputs:
+  WebsiteURL:
+    Description: HTTP ALB test URL - coursework PoC ONLY, not HTTPS banking production.
+    Value: !Sub 'http://${SterlingALB.DNSName}'
+  ALBDnsName:
+    Value: !GetAtt SterlingALB.DNSName
+  VpcId:
+    Value: !Ref SterlingVPC
+  PublicSubnetAId:
+    Value: !Ref PublicSubnetA
+  PublicSubnetBId:
+    Value: !Ref PublicSubnetB
+  PrivateSubnetAId:
+    Value: !Ref PrivateSubnetA
+  PrivateSubnetBId:
+    Value: !Ref PrivateSubnetB
+  ALBSecurityGroupId:
+    Value: !Ref AlbSecurityGroup
+  WebSecurityGroupId:
+    Value: !Ref WebSecurityGroup
+  AutoScalingGroupName:
+    Value: !Ref WebAutoScalingGroup
+  TradingTableName:
+    Value: !Ref TradingMarketData
+  WebPlacement:
+    Value: !Ref WebPlacement
